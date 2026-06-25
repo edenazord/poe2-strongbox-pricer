@@ -79,7 +79,7 @@ import tkinter as tk
 from tkinter import ttk
 
 # ── config ─────────────────────────────────────────────────────────────────────
-APP_VERSION     = "1.0.0"
+APP_VERSION     = "1.1.0"
 GITHUB_REPO     = "edenazord/poe2-strongbox-pricer"
 PRICE_TTL_MIN   = 60
 if getattr(sys, 'frozen', False):
