@@ -92,12 +92,14 @@ logging.basicConfig(filename=str(LOG_FILE), level=logging.DEBUG,
                     format="%(asctime)s %(levelname)s %(message)s",
                     encoding="utf-8")
 _log = logging.getLogger("poe2pricer")
-SCAN_INTERVAL_S = 0.15  # secondi tra ogni scan OCR
+SCAN_INTERVAL_S = 1.0   # secondi tra ogni scan OCR (ridotto per performance)
 # Regione schermo da scansionare (percentuale): lato sinistro dove appare il pannello
 SCAN_LEFT_PCT  = 0.00
 SCAN_TOP_PCT   = 0.03
 SCAN_RIGHT_PCT = 0.62
 SCAN_BOT_PCT   = 0.88
+# Soglia minima di cambiamento pixel per lanciare OCR (evita scan inutili)
+CHANGE_THRESHOLD = 0.02  # 2% dei pixel campionati devono cambiare
 
 LEAGUES_API      = "https://www.pathofexile.com/api/trade2/data/leagues"
 TRADE_FETCH_API  = "https://www.pathofexile.com/api/trade2/fetch"
@@ -318,6 +320,8 @@ class ScreenMonitor:
         self._on_debug = on_debug
         self._running  = False
         self._last_raw = ""
+        self._last_sample = None  # campione pixel per change detection
+        self._idle_count  = 0     # conteggio cicli senza cambiamento
 
     def start(self):
         self._running = True
@@ -327,6 +331,7 @@ class ScreenMonitor:
 
     def scan_now(self):
         """Scan forzato (F6)."""
+        self._last_sample = None  # forza bypass change detection
         threading.Thread(target=self._do_scan, daemon=True).start()
 
     def _loop(self):
@@ -337,7 +342,32 @@ class ScreenMonitor:
                 except Exception as e:
                     _log.error(f"Scan error: {e}\n{traceback.format_exc()}")
                     self._on_debug(f"Errore scan: {e}", RED)
-                time.sleep(SCAN_INTERVAL_S)
+                # Intervallo adattivo: se lo schermo non cambia, rallenta
+                interval = SCAN_INTERVAL_S
+                if self._idle_count > 5:
+                    interval = min(SCAN_INTERVAL_S * 2, 3.0)
+                time.sleep(interval)
+
+    def _screen_changed(self, img: Image.Image) -> bool:
+        """Confronto rapido pixel: ritorna True se lo schermo è cambiato abbastanza."""
+        # Ridimensiona a thumbnail piccola per confronto veloce
+        thumb = img.resize((64, 36), Image.NEAREST)
+        sample = thumb.tobytes()
+        if self._last_sample is None:
+            self._last_sample = sample
+            return True  # primo scan → procedi
+        if sample == self._last_sample:
+            self._idle_count += 1
+            return False
+        # Conta pixel differenti
+        diff = sum(1 for a, b in zip(sample, self._last_sample) if abs(a - b) > 20)
+        ratio = diff / len(sample)
+        self._last_sample = sample
+        if ratio < CHANGE_THRESHOLD:
+            self._idle_count += 1
+            return False
+        self._idle_count = 0
+        return True
 
     def _do_scan(self, sct=None):
         own_sct = sct is None
@@ -353,6 +383,10 @@ class ScreenMonitor:
             }
             shot = sct.grab(region)
             img  = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+            # Change detection: salta OCR se lo schermo non è cambiato
+            if not self._screen_changed(img):
+                return
 
             if not _HAS_OCR:
                 self._on_debug("OCR non disponibile – pip install rapidocr-onnxruntime", RED)
@@ -457,8 +491,10 @@ class InGamePriceOverlay:
     """Overlay trasparente a tutto schermo che mostra prezzi accanto agli item in gioco."""
 
     _TRANSP = "#010101"   # chromakey: questo colore diventa trasparente
+    _BOX_BG = "#0a0a0a"   # sfondo nero solido per i riquadri prezzo
 
     def __init__(self, root: tk.Misc):
+        self._root = root
         self._win = tk.Toplevel(root)
         self._win.overrideredirect(True)            # nessuna barra titolo
         self._win.attributes("-topmost", True)
@@ -469,6 +505,28 @@ class InGamePriceOverlay:
         self._win.geometry(f"{sw}x{sh}+0+0")
         self._win.withdraw()
         self._labels: list[tk.Label] = []
+        self._has_items = False
+
+        # Quando il root viene minimizzato, ri-mostra l'overlay
+        root.bind("<Unmap>", self._on_root_unmap, add="+")
+        root.bind("<Map>", self._on_root_map, add="+")
+
+    def _on_root_unmap(self, event=None):
+        """Quando il main è minimizzato, forza l'overlay visibile."""
+        if self._has_items:
+            self._win.after(150, self._force_visible)
+
+    def _on_root_map(self, event=None):
+        """Quando il main è ripristinato, assicura overlay visibile."""
+        if self._has_items:
+            self._win.after(50, self._force_visible)
+
+    def _force_visible(self):
+        """Forza l'overlay in primo piano."""
+        if self._has_items:
+            self._win.deiconify()
+            self._win.lift()
+            self._win.attributes("-topmost", True)
 
     def show(self, items: list[dict], currency_sym: str = "c"):
         """Mostra i prezzi in-game. Items con screen_y e screen_right vengono posizionati."""
@@ -478,9 +536,11 @@ class InGamePriceOverlay:
 
         positioned = [it for it in items if "screen_y" in it and "screen_right" in it]
         if not positioned:
+            self._has_items = False
             self._win.withdraw()
             return
 
+        self._has_items = True
         for it in positioned:
             price = it.get("price")
             qty   = it.get("qty", 1)
@@ -488,14 +548,16 @@ class InGamePriceOverlay:
             sx    = it["screen_right"] + 16   # 16px a destra del testo rilevato
             if price and price > 0:
                 total = price * qty
-                txt   = f"{total:.1f}{currency_sym}"
+                txt   = f" {total:.1f}{currency_sym} "
                 col   = GREEN if total >= 5 else (ORANGE if total >= 1 else RED)
             else:
-                txt, col = "?", GRAY
-            lbl = tk.Label(self._win, text=txt, bg=self._TRANSP, fg=col,
+                txt, col = " ? ", GRAY
+            lbl = tk.Label(self._win, text=txt, bg=self._BOX_BG, fg=col,
                            font=("Segoe UI", 13, "bold"),
-                           padx=0, pady=0, borderwidth=0, highlightthickness=0)
-            lbl.place(x=sx, y=sy - 10)
+                           padx=6, pady=2, borderwidth=1,
+                           highlightthickness=1, highlightbackground="#333333",
+                           relief="solid")
+            lbl.place(x=sx, y=sy - 12)
             self._labels.append(lbl)
 
         self._win.deiconify()
@@ -505,6 +567,7 @@ class InGamePriceOverlay:
         for lbl in self._labels:
             lbl.destroy()
         self._labels.clear()
+        self._has_items = False
         self._win.withdraw()
 
 
