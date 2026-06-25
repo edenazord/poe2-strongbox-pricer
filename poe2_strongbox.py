@@ -79,6 +79,8 @@ import tkinter as tk
 from tkinter import ttk
 
 # ── config ─────────────────────────────────────────────────────────────────────
+APP_VERSION     = "1.0.0"
+GITHUB_REPO     = "edenazord/poe2-strongbox-pricer"
 PRICE_TTL_MIN   = 60
 if getattr(sys, 'frozen', False):
     _APP_DIR = Path(sys.executable).parent
@@ -519,6 +521,8 @@ class StrongboxOverlay:
 
         self._cache   = PriceCache()
         self._ingame  = InGamePriceOverlay(self.root)
+        self._updater = AutoUpdater(self.root,
+                                    debug_cb=lambda m, c=GRAY: self._set_debug(m, c))
         self._monitor = ScreenMonitor(
             price_cache=self._cache,
             on_items=lambda items: self.root.after(0, lambda: self._show_items(items)),
@@ -541,7 +545,7 @@ class StrongboxOverlay:
         bar.bind("<ButtonPress-1>", lambda e: (setattr(self,"_dx",e.x), setattr(self,"_dy",e.y)))
         bar.bind("<B1-Motion>",     lambda e: r.geometry(
             f"+{r.winfo_x()+e.x-self._dx}+{r.winfo_y()+e.y-self._dy}"))
-        tk.Label(bar, text="  PoE2 Strongbox Pricer", bg=BORDER, fg=GOLD,
+        tk.Label(bar, text=f"  PoE2 Strongbox Pricer v{APP_VERSION}", bg=BORDER, fg=GOLD,
                  font=("Segoe UI",10,"bold")).pack(side=tk.LEFT, pady=5)
         self._lbl_league = tk.Label(bar, text="", bg=BORDER, fg=GRAY, font=("Segoe UI",8))
         self._lbl_league.pack(side=tk.LEFT, padx=6)
@@ -669,6 +673,9 @@ class StrongboxOverlay:
                 self.root.after(0, lambda: self._set_debug(
                     "Errore: componente OCR mancante", RED))
 
+            # 6) Check aggiornamenti
+            self._updater.check_async()
+
         threading.Thread(target=_start, daemon=True).start()
 
     # ── mostra item rilevati ───────────────────────────────────────────────────
@@ -751,6 +758,133 @@ class StrongboxOverlay:
 
     def run(self):
         self.root.mainloop()
+
+
+# ── Auto-updater ───────────────────────────────────────────────────────────────
+class AutoUpdater:
+    """Controlla GitHub Releases per aggiornamenti e scarica il nuovo exe."""
+
+    RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+    def __init__(self, root: tk.Tk, debug_cb=None):
+        self._root = root
+        self._debug = debug_cb or (lambda m, c=GRAY: None)
+        self._banner: tk.Frame | None = None
+
+    def check_async(self):
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def _check(self):
+        try:
+            r = requests.get(self.RELEASES_API, headers={"Accept": "application/vnd.github+json"},
+                             timeout=10)
+            if not r.ok:
+                _log.debug(f"Update check HTTP {r.status_code}")
+                return
+            data = r.json()
+            tag = data.get("tag_name", "").lstrip("v")
+            if not tag or tag == APP_VERSION:
+                return
+            # Confronto semplice: se il tag è diverso → aggiornamento disponibile
+            if self._version_tuple(tag) <= self._version_tuple(APP_VERSION):
+                return
+            # Cerca l'asset .exe
+            exe_url = None
+            exe_name = None
+            for asset in data.get("assets", []):
+                if asset["name"].lower().endswith(".exe"):
+                    exe_url = asset["browser_download_url"]
+                    exe_name = asset["name"]
+                    break
+            if not exe_url:
+                return
+            self._root.after(0, lambda: self._show_banner(tag, exe_url, exe_name,
+                                                          data.get("body", "")))
+        except Exception as e:
+            _log.debug(f"Update check error: {e}")
+
+    @staticmethod
+    def _version_tuple(v: str):
+        parts = []
+        for p in v.split("."):
+            try: parts.append(int(p))
+            except ValueError: parts.append(0)
+        return tuple(parts)
+
+    def _show_banner(self, version: str, url: str, name: str, notes: str):
+        if self._banner:
+            return
+        self._banner = tk.Frame(self._root, bg="#1a3a1a")
+        self._banner.pack(fill=tk.X, padx=8, pady=(4, 0), before=self._root.winfo_children()[1])
+        tk.Label(self._banner, text=f"Aggiornamento v{version} disponibile!",
+                 bg="#1a3a1a", fg=GREEN, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=8)
+        tk.Button(self._banner, text="Scarica", bg=GREEN, fg="#000", relief=tk.FLAT,
+                  font=("Segoe UI", 8, "bold"), cursor="hand2",
+                  command=lambda: self._download(url, name, version)).pack(side=tk.LEFT, padx=4)
+        tk.Button(self._banner, text="✕", bg="#1a3a1a", fg=GRAY, relief=tk.FLAT,
+                  font=("Segoe UI", 8), cursor="hand2",
+                  command=lambda: (self._banner.destroy(), setattr(self, '_banner', None))
+                  ).pack(side=tk.RIGHT, padx=4)
+
+    def _download(self, url: str, name: str, version: str):
+        self._debug(f"Download v{version} in corso...", ORANGE)
+        threading.Thread(target=lambda: self._do_download(url, name, version), daemon=True).start()
+
+    def _do_download(self, url: str, name: str, version: str):
+        try:
+            r = requests.get(url, stream=True, timeout=120)
+            r.raise_for_status()
+            if getattr(sys, 'frozen', False):
+                exe_path = Path(sys.executable)
+                new_path = exe_path.parent / f"{exe_path.stem}_v{version}.exe"
+            else:
+                new_path = _APP_DIR / name
+            with open(new_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            self._root.after(0, lambda: self._debug(
+                f"v{version} scaricata: {new_path.name} — riavvia l'app", GREEN))
+            if self._banner:
+                self._root.after(0, lambda: self._replace_banner_with_restart(new_path))
+        except Exception as e:
+            _log.error(f"Download error: {e}")
+            self._root.after(0, lambda: self._debug(f"Errore download: {e}", RED))
+
+    def _replace_banner_with_restart(self, new_path: Path):
+        if self._banner:
+            self._banner.destroy()
+        self._banner = tk.Frame(self._root, bg="#1a3a1a")
+        self._banner.pack(fill=tk.X, padx=8, pady=(4, 0), before=self._root.winfo_children()[1])
+        tk.Label(self._banner, text=f"Aggiornamento scaricato!",
+                 bg="#1a3a1a", fg=GREEN, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=8)
+        if getattr(sys, 'frozen', False):
+            tk.Button(self._banner, text="Riavvia ora", bg=GREEN, fg="#000", relief=tk.FLAT,
+                      font=("Segoe UI", 8, "bold"), cursor="hand2",
+                      command=lambda: self._restart(new_path)).pack(side=tk.LEFT, padx=4)
+        else:
+            tk.Label(self._banner, text=f"{new_path.name}",
+                     bg="#1a3a1a", fg=WHITE, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
+
+    def _restart(self, new_path: Path):
+        """Sostituisce il vecchio exe col nuovo e riavvia."""
+        try:
+            current = Path(sys.executable)
+            backup  = current.with_suffix(".old")
+            # Rinomina corrente → .old, nuovo → corrente
+            bat = current.parent / "_update.bat"
+            bat.write_text(
+                f'@echo off\n'
+                f'timeout /t 2 /nobreak >nul\n'
+                f'del "{current}"\n'
+                f'move "{new_path}" "{current}"\n'
+                f'start "" "{current}"\n'
+                f'del "%~f0"\n',
+                encoding="utf-8"
+            )
+            os.startfile(str(bat))
+            self._root.destroy()
+        except Exception as e:
+            _log.error(f"Restart error: {e}")
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
